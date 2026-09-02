@@ -1314,6 +1314,140 @@ public final class SwitchGateUpFusedStorage {
     }
 }
 
+// MARK: - FLASH-MOE-PREFILL: transient tiled expert MLP prototype
+
+/// Experimental and intentionally opt-in. The kernel is a correctness-first
+/// prototype for the exact Gemma 4 expert contract. It consumes the sorted
+/// expert plane and sorted keys already produced above; it does not create a
+/// second routing or regrouping structure.
+private let switchFlashMoEPrefillEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_PREFILL_FLASH_MOE"]
+    else { return false }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// One group owns one expert and walks that expert's contiguous sorted run.
+/// The 2816-element accumulator is threadgroup-local; the 64-element gate,
+/// up, and GeGLU tiles never leave threadgroup memory.
+private let switchFlashMoEKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "gemma4_prefill_flash_moe_q4_g64_t64_v1",
+    inputNames: [
+        "x", "indices", "gate_up_weight", "gate_up_scales", "gate_up_biases",
+        "down_weight", "down_scales", "down_biases",
+    ],
+    outputNames: ["out"],
+    source: """
+        const uint tid = thread_position_in_threadgroup.x;
+        const uint expert = threadgroup_position_in_grid.x;
+        const uint assignment_count = indices_shape[0];
+
+        threadgroup uint bounds[2];
+        threadgroup T gate_tile[64];
+        threadgroup T up_tile[64];
+        threadgroup T h_tile[64];
+        threadgroup float y_accumulator[2816];
+
+        // `indices` is the existing stable expert-major route table. Since it
+        // is sorted, one cursor identifies this expert's complete run without
+        // building another boundary/index buffer.
+        uint cursor = 0u;
+        if (tid == 0u) {
+            while (cursor < assignment_count && indices[cursor] < expert) {
+                cursor++;
+            }
+            const uint begin = cursor;
+            while (cursor < assignment_count && indices[cursor] == expert) {
+                cursor++;
+            }
+            bounds[0] = begin;
+            bounds[1] = cursor;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const uint begin = bounds[0];
+        const uint end = bounds[1];
+        for (uint assignment = begin; assignment < end; assignment++) {
+            // Each lane owns 44 output elements. This accumulator is reset for
+            // one sorted assignment and retained across all 11 H tiles.
+            for (uint n = tid; n < 2816u; n += 64u) {
+                y_accumulator[n] = 0.0f;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint tile_base = 0u; tile_base < 704u; tile_base += 64u) {
+                const uint j = tile_base + tid;
+                float gate_sum = 0.0f;
+                float up_sum = 0.0f;
+                for (uint k = 0u; k < 2816u; k++) {
+                    const float value = static_cast<float>(x[
+                        size_t(assignment) * 2816u + k]);
+                    gate_sum += value * flash_moe_q4<T>(
+                        gate_up_weight, gate_up_scales, gate_up_biases,
+                        expert, j, k, 1408u, 352u, 44u);
+                    up_sum += value * flash_moe_q4<T>(
+                        gate_up_weight, gate_up_scales, gate_up_biases,
+                        expert, 704u + j, k, 1408u, 352u, 44u);
+                }
+
+                // Match the two gathered QMM outputs' BF16 materialization
+                // before applying the existing tanh-approximate GeGLU math.
+                gate_tile[tid] = static_cast<T>(gate_sum);
+                up_tile[tid] = static_cast<T>(up_sum);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                const float gate = static_cast<float>(gate_tile[tid]);
+                const float up = static_cast<float>(up_tile[tid]);
+                const float gelu = 0.5f * gate * (1.0f + tanh(
+                    sqrt(2.0f / 3.14159265358979323846f)
+                        * (gate + 0.044715f * gate * gate * gate)));
+                h_tile[tid] = static_cast<T>(gelu * up);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                for (uint n = tid; n < 2816u; n += 64u) {
+                    float accumulator = y_accumulator[n];
+                    for (uint local_j = 0u; local_j < 64u; local_j++) {
+                        accumulator += static_cast<float>(h_tile[local_j])
+                            * flash_moe_q4<T>(
+                                down_weight, down_scales, down_biases,
+                                expert, n, tile_base + local_j,
+                                2816u, 88u, 11u);
+                    }
+                    y_accumulator[n] = accumulator;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+
+            for (uint n = tid; n < 2816u; n += 64u) {
+                out[size_t(assignment) * 2816u + n] =
+                    static_cast<T>(y_accumulator[n]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    """,
+    header: """
+        template <typename T>
+        inline float flash_moe_q4(
+            const device uint* weight,
+            const device T* scales,
+            const device T* biases,
+            uint expert,
+            uint output_row,
+            uint input_index,
+            uint output_rows,
+            uint packed_columns,
+            uint group_columns) {
+            const size_t row = size_t(expert) * output_rows + output_row;
+            const uint word = weight[row * packed_columns + (input_index >> 3u)];
+            const uint q = (word >> ((input_index & 7u) * 4u)) & 0x0fu;
+            const size_t group = row * group_columns + (input_index >> 6u);
+            return static_cast<float>(scales[group]) * static_cast<float>(q)
+                + static_cast<float>(biases[group]);
+        }
+    """,
+    ensureRowContiguous: true
+)
+
 // MARK: - SwitchGLU
 
 /// Semantic profile required by the exact Gemma direct-reduction experiment.
@@ -1563,6 +1697,67 @@ public class SwitchGLU: Module {
                 (x, idx, inverseOrder) = gatherSort(
                     x: x, indices: indices, numExperts: numExperts)
             }
+        }
+
+        // FLASH-MOE-PREFILL: consume the already sorted expert plane directly.
+        // The 3-D sorted plane is only supplied by the prefill pre-norm
+        // producer; decode uses the lhs-index route-table form and therefore
+        // cannot enter this branch. Any failed storage or metadata check falls
+        // through to the existing gate/up -> GeGLU -> down sequence below.
+        let flashMoEAdmission = switchFlashMoEPrefillEnabled
+            && sortedPlane != nil
+            && doSort
+            && !useLhsIndices
+            && lhsIndices == nil
+            && inputDims == 2816
+            && hiddenDims == 704
+            && numExperts == 128
+            && indices.ndim == 2
+            && indices.dim(1) == 8
+            && indices.dtype == .uint32
+            && x.ndim == 3
+            && x.dim(0) == indices.size
+            && x.dim(1) == 1
+            && x.dim(2) == 2816
+            && x.dtype == .bfloat16
+            && idx.ndim == 1
+            && idx.size == x.dim(0)
+            && idx.dtype == .uint32
+
+        if flashMoEAdmission {
+            let down = downProj as? QuantizedSwitchLinear
+            if let fused = fusedGateUpDispatch(),
+                let down,
+                let downBiases = down.biases,
+                down.inputDims == 704,
+                down.outputDims == 2816,
+                down.numExperts == 128,
+                down.groupSize == 64,
+                down.bits == 4,
+                down.mode == .affine,
+                down.bias == nil,
+                down.weight.shape == [128, 2816, 88],
+                down.scales.shape == [128, 2816, 11],
+                downBiases.shape == [128, 2816, 11],
+                down.weight.dtype == .uint32,
+                down.scales.dtype == .bfloat16,
+                downBiases.dtype == .bfloat16
+            {
+                CBv2EngageMark.once("prefill-flash-moe")
+                let output = switchFlashMoEKernel(
+                    [
+                        x, idx, fused.storage.weight, fused.storage.scales,
+                        fused.storage.biases, down.weight, down.scales, downBiases,
+                    ],
+                    template: [("T", x.dtype)],
+                    grid: (numExperts, 1, 1),
+                    threadGroup: (64, 1, 1),
+                    outputShapes: [x.shape],
+                    outputDTypes: [x.dtype]
+                )[0]
+                return (output, inverseOrder, true)
+            }
+            CBv2EngageMark.once("prefill-flash-moe-fallback")
         }
 
         let xGate: MLXArray
