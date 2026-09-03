@@ -1939,3 +1939,94 @@ Release build clean (no new warnings in touched files). Contract suite
 kill-switched (`..._HOIST=0 ..._CACHE=0 ..._EVERY_N=1 ..._SKIP=0
 ..._BATCH=0`, i.e. the legacy paths). No local benchmark run and no
 cool-gate wait per plan.
+
+## 12. Batch record fetch (E) + full-arc changelog
+
+Same branch (`fused-moe-prefill-v2`). This section both records the
+latest change and consolidates everything landed by the decode host-path
+arc (§10–§12) in one place, since the work is now a stack of five
+gated micro-optimizations plus two ungated dedups.
+
+### 12.1 What E is
+
+`SchedulerV2.records(for:)` (`SchedulerV2.swift`, next to
+`record(for:)`): batch twin returning the same live
+`CBv2ScheduledRequest` references in `ids` order. Rewired call sites
+(all in `EngineLoopV2.swift`): the `finalize` per-row loop (batch over
+`step.sampledRows`, indexed in order) and the `chainedDecodeMetadata`
+miss-path rebuild. Deliberately NOT rewired: `refreshProgressLeases`
+(iterates a `Set`, so batching would add an `Array` alloc for no
+saving), `executeMixed`'s `RowWork` build (prefill/mixed path, not the
+scored chained path; batching would add a `map(\.id)` alloc), the
+`rowContext` closure (membership-change only, cold), and `rollback`
+(failure path, cold).
+
+Equivalence argument (the load-bearing fact): `CBv2ScheduledRequest`
+is a `final class` (`SchedulerV2.swift:51`), so the batch returns the
+identical objects a repeated subscript would — no snapshot/staleness
+semantics can differ under any interleaving, because every mutation the
+rewired loop bodies perform (`recordSampled`, `finishRequest` →
+`scheduler.finish`/`kvStates.removeValue`) is per-id and rows are
+distinct. Unconditional/ungated (no env flag): a pure read substitution
+with identical values cannot change behavior, same rationale as the
+single-scan dedup (§11.5). Honestly assessed as hygiene with ~zero
+expected gain (it collapses N call sites, not the N hashes) — included
+because it is free, reviewable (~20 lines), and removes a repeated
+pattern future work would otherwise copy.
+
+### 12.2 What was NOT implemented from Tier 2, and why
+
+- **F (logprob gating):** nothing to do — the `topLogprobs` reduce
+  already sits inside `if let rawLogprobs`, and `pipeline.commit`
+  already early-returns. Verified, not re-listed as work.
+- **G (`plan()` short-circuit for pure decode):** rejected as scoped.
+  A short-circuit that skips `scheduler.plan()` must still replicate
+  its per-row reserves (ledger mutations), `numComputedTokens`
+  advances, `markPendingSamples`, speculation hooks, and
+  requeue/preemption handling — which is exactly the full `chainPlan`
+  fast path (scan idea #6, ~100–180 lines + ledger-parity tests). A
+  "narrower" G that skips reserves would drift the capacity ledger and
+  is unsafe; a safe G collapses into D. G stays folded into D (still
+  open, still deferred behind box measurements).
+
+### 12.3 Consolidated landed stack (all default-ON unless noted)
+
+| # | Change | Flag (kill = legacy) | Files | Size | Nature |
+|---|---|---|---|---|---|
+| §10.1 | MoE descriptor hoist + per-instance eligibility cache | `DARKBLOOM_GEMMA4_MOE_DESC_HOIST`, ON | `SwitchLayers.swift` | ~60L | fewer bridge reads/allocs, 30x/token |
+| §10.1 | Shared route descriptors + pure-read dedup (`size`, `shape`) | unconditional (identical values) | `SwitchLayers.swift` | ~15L | fewer host allocs |
+| §10.2 | Chained triple memo (ids/rowStates/params + KV identity) | `MLXFAST_CHAIN_TRIPLE_CACHE`, ON | `EngineLoopV2.swift` | ~100L | fewer lookups/allocs per chained step |
+| §11.2 | Gauge throttle (steady sites every 4th; events exact) | `MLXFAST_PUBLISH_GAUGES_EVERY_N`, default 4 | `EngineLoopV2.swift` | ~25L | fewer locks/backend queries |
+| §11.3 | Lease-scan idle skip (empty table only) | `MLXFAST_LEASE_SCAN_IDLE_SKIP`, ON | `EngineLoopV2.swift` | ~12L | skips provably empty scan |
+| §11.4 | Usage-snapshot batching (one lock/step) | `MLXFAST_USAGE_SNAPSHOT_BATCH`, ON | `EngineLoopV2.swift` | ~30L | 8 locks → 1 per step |
+| §11.5 | Single greedy/order-only scan + debug assert | unconditional + `assert` | `EngineLoopV2.swift`, `LogitsPipelineV2.swift` | ~20L | hygiene, ~zero gain |
+| §12.1 | Batch record fetch | unconditional (identical refs) | `SchedulerV2.swift`, `EngineLoopV2.swift` | ~20L | hygiene, ~zero gain |
+
+Deliberately untouched after audit: per-row `stream(for:)` lookups
+(cross-thread `streams` state — 7 uncontended locks not worth the race
+analysis), `executeMixed` record fetches (non-scored path),
+`markPendingSamples`/`rollback` loops (ledger-coupled or cold),
+`refreshProgressLeases` record fetches (`Set` iteration — batching
+would add an alloc).
+
+### 12.4 Standing rejects (verified dead ends, do not re-propose)
+
+vNorm-equals-kNorm reuse (weighted vs unweighted — wrong model);
+sampler-commit early-out (one 8-iteration counter, RNG-step risk);
+position `+0` dedup and softcap scalar hoist (already no-ops on the hot
+path); hand-fusing RMSNorm/RoPE/SDPA/GeGLU internals (already
+single/compiled kernels); generic elementwise hand-fusion outside
+`compile()` (lazy eval does not fuse — needs `compile{}`, not Metal);
+residual-Add-into-Custom fusion (`is_fusable()==false` barrier);
+cross-layer RoPE memo, decode gate/up fusion, transpose-tail fusion
+(all need kernel signature changes); full `chainPlan` (open, deferred);
+routing-scratch ring (open, deferred).
+
+### 12.5 Verification (this change)
+
+Release build clean. Contract suite 583/22 green in the default
+environment (everything ON) and fully kill-switched (all five flags to
+legacy). E's debug coverage rides the same suites; the B `assert`
+remains active in test builds. No local benchmark run, no cool-gate
+wait per plan. Ranked-box measurement is the verdict for the whole
+stack; if the loop is GPU-bound the expected outcome is neutral.
