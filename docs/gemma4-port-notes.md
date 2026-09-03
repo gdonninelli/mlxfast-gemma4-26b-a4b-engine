@@ -1800,3 +1800,73 @@ gitlink advance, so no engine-side fixture repin was required for that
 advance. Reproduce via engine
 `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
 --force-resolved-versions --filter emitEngineWireFixture`.
+
+## 10. Decode host-path micro-caches (MoE descriptors + chained triple)
+
+Branch `fused-moe-prefill-v2`. Two small, host-side-only decode-path
+optimizations. No kernel, Metal, quantization, or numerical change: every
+cached item is either a provably constant value or a decision whose dynamic
+half still runs per call, and both arms fail closed to the legacy code when
+their flag is unset.
+
+### 10.1 MoE static descriptor + admits-Bool hoist
+
+File: `Vendor/mlx-swift-lm/Libraries/MLXLMCommon/SwitchLayers.swift`.
+
+- Shared launch descriptors for the exact B=8 decode route table
+  (`routeSimdRank64Grid/ThreadGroup/OutputShapes/OutputDTypes`): the
+  tuple/array literals were rebuilt on every routing call (30x per decode
+  token, at the `gatherSort` and `gatherSortIndices` sites). Values are
+  constant; sharing removes the host allocs. Unconditional (provably
+  identical values, callee never mutates them).
+- `supportsWeightedExpertUnsort`: the module-geometry half
+  (`inputDims`/`hiddenDims`/`numExperts`/`gateUpProj`/`activationProduct`/
+  `isGeluActivation`) is cached per `SwitchGLU` instance
+  (`staticUnsortGeometryEligible`, same `lazy` pattern as
+  `expertPrefixBoundsProjectionsEligible`). Per-instance, never
+  file-global: `SwitchGLU` is shared with other architectures. The dynamic
+  tensor half (ndim/dim/shape/dtype/size) still runs per call.
+- Pure-read dedup, unconditional: `indices.size` read once per
+  `projectExperts` (was twice: `useLhsIndices` + `doSort`); `gate.shape`
+  read once per `geGLUClaimsPinnedDecode` (was compare-then-re-read).
+
+Kill switch: `DARKBLOOM_GEMMA4_MOE_DESC_HOIST` — unset or
+`0`/`false`/`no`/`off` restores the legacy inline comparisons exactly;
+`=1` enables the cached-eligibility path. Read once into a file-scope
+`let`, same pattern as the neighbouring flags.
+
+### 10.2 Chained triple cache
+
+File: `Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/EngineLoopV2.swift`.
+
+`launchChainedDecode` rebuilt `ids`/`rowStates`/`params` from scratch every
+chained B=8 step (plan ids alloc + 8 `kvStates` lookups + 8
+`scheduler.record` lookups + struct copies) although the chain guard had
+just proved the cohort unchanged. `chainedDecodeMetadata(ids:)` keeps a
+single-step memo and reuses it on an exact hit: flag on, memo valid,
+ordered ids equal, MTP nil-or-target-only, presence re-verified, and every
+row's KV slots still the identical objects (per-slot `ObjectIdentifier`
+fingerprint — preemption, adoption, donation, rollback, and id-reuse all
+change identities and miss). Sampling params and token constraints are
+immutable post-submit, and the chain guard re-checks constraint-nil plus
+`mtpWantsStep` every step before launch regardless.
+
+Explicitly NOT done (kept as specified): `scheduler.plan()`,
+`isPureDecodePlan`, capacity reserves, `markPendingSamples`, and ledger
+updates all still run — this only avoids rebuilding identical host arrays.
+No full `chainPlan` fast path. Memo is invalidated on the chain-broken
+general path and in `finishRequest`; any missed invalidation still fails
+closed via the identity check.
+
+Kill switch: `MLXFAST_CHAIN_TRIPLE_CACHE` — unset or
+`0`/`false`/`no`/`off` keeps the legacy rebuild; `=1` enables the memo.
+Read once into a file-scope `let`.
+
+### 10.3 Verification
+
+`swift build -c release --force-resolved-versions` clean (98.6s; only
+pre-existing warnings in untouched files). `swift test
+--force-resolved-versions`: 583 tests / 22 suites pass under all four
+flag combinations (OFF/OFF, MoE-only, chain-only, both ON). No
+`./benchmark.sh --local-iterate` run per plan (directional local
+benchmarking deferred to the ranked box).
