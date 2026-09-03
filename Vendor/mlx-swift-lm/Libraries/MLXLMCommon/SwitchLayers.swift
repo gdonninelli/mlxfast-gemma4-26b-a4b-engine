@@ -1951,6 +1951,162 @@ private let switchFlashMoENAXKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel
     ensureRowContiguous: true
 )
 
+// MARK: - NAX-DOWN-PREFILL: specialized expert down-projection only
+
+/// NAX-DOWN-PREFILL. Replaces ONLY the large expert down projection
+/// (`[M, 704] x [704, 2816] -> [M, 2816]`) on the sorted routed-expert
+/// prefill plane with a specialized NAX kernel. Routing, sorting, the gate
+/// and up projections, and GeGLU stay exactly as dispatched today; the
+/// incumbent `downProj` gathered-QMM runs whenever this arm declines.
+///
+/// Tiling mirrors the fused kernel's down phase verbatim: one threadgroup
+/// per eight-row expert tile (physical BM = 16, logical rows <= 8 masked via
+/// `load_rows`/`store_safe`), BN = 64, BK = 64, WM = 1, WN = 2 (64 threads,
+/// 2 SIMDgroups). The K loop (704, 11 steps) and the per-element MMA
+/// accumulation order are unchanged from the incumbent gathered-QMM path,
+/// and dequantization is the same affine group-64 nibble formula evaluated
+/// in bfloat16, so the stored bf16 outputs match the incumbent's rounding
+/// boundary.
+///
+/// Routing comes from the already-computed PREFILL-CSORT-128 scan
+/// (`expert_offsets`/`tile_offsets`, 129 entries); no second sort or
+/// regrouping is introduced. Decode (lhs-index route) and speculative
+/// verification (no scan metadata, small rows) never qualify.
+///
+/// Kill switch: `DARKBLOOM_GEMMA4_PREFILL_NAX_DOWN=1` arms it; default OFF.
+/// Engage mark: `prefill-nax-down`.
+private let switchNaxDownPrefillEnabled: Bool = {
+    guard let raw = ProcessInfo.processInfo.environment[
+        "DARKBLOOM_GEMMA4_PREFILL_NAX_DOWN"]
+    else { return false }
+    return !["0", "false", "no", "off"].contains(raw.lowercased())
+}()
+
+/// One threadgroup owns one eight-row expert tile (found by binary search
+/// over `tile_offsets`, exactly as the fused NAX MoE kernel routes) and
+/// streams all 44 BN = 64 down-projection tiles for those rows. `h` is the
+/// already-sorted GeGLU plane `[rows, 1, 704]`; `out` is `[rows, 1, 2816]`.
+/// Threadgroup memory is only the dequant staging `ws` (64 x 72 bf16) plus
+/// the 3-word route triple: 4608 * 2 + 12 = 9228 bytes, ~28% of the 32 KiB
+/// budget the repository's attention kernels treat as the limit.
+private let switchNaxDownPrefillKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+    name: "gemma4_prefill_nax_down_m8_v1",
+    inputNames: [
+        "h", "down_weight", "down_scales", "down_biases", "expert_offsets",
+        "tile_offsets",
+    ],
+    outputNames: ["out"],
+    source: """
+        const uint tid = thread_index_in_threadgroup;
+        const uint group = threadgroup_position_in_grid.x;
+        threadgroup uint route[3];
+        if (tid == 0u) {
+            if (group >= tile_offsets[128]) {
+                route[2] = 0u;
+            } else {
+                uint lo = 0u;
+                uint hi = 128u;
+                while (lo + 1u < hi) {
+                    const uint mid = (lo + hi) / 2u;
+                    if (tile_offsets[mid] <= group) {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                const uint begin = expert_offsets[lo]
+                    + (group - tile_offsets[lo]) * 8u;
+                route[0] = lo;
+                route[1] = begin;
+                route[2] = min(8u, expert_offsets[lo + 1u] - begin);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (route[2] == 0u) {
+            return;
+        }
+
+        const uint expert = route[0];
+        const uint assignment = route[1];
+        const short valid_rows = static_cast<short>(route[2]);
+        threadgroup bfloat16_t ws[64 * 72];
+
+        for (uint tile = 0u; tile < 44u; ++tile) {
+            const uint base = tile * 64u;
+            mlx::steel::flash_moe_qmm_t_nax(
+                down_weight, down_scales, down_biases, h + assignment * 704u,
+                out + assignment * 2816u + base, ws,
+                expert, base, 2816, 704, 2816, valid_rows,
+                simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    """,
+    header: switchFlashMoENAXHeader,
+    ensureRowContiguous: true
+)
+
+/// Exact production down-projection contract only. Returns nil (fail closed
+/// onto the incumbent `downProj` gathered-QMM) unless every geometric,
+/// dtype, quantization and routing assumption holds.
+private func switchNaxDownPrefill(
+    activated: MLXArray,
+    idx: MLXArray,
+    route: RouteCsortPrefillResult?,
+    down: QuantizedSwitchLinear?
+) -> MLXArray? {
+    guard switchNaxDownPrefillEnabled,
+        let route,
+        let down,
+        // Sorted prefill plane only: `[rows, 1, 704]` bf16 with the sorted
+        // expert key per row.
+        activated.ndim == 3,
+        activated.dim(1) == 1,
+        activated.dim(2) == 704,
+        activated.dtype == .bfloat16,
+        // Mirror the host's sorted right-hand-side floor (at least
+        // `4 * experts` rows): prefill rows qualify, the 64-assignment
+        // decode cohort and small speculative rectangles do not.
+        activated.dim(0) >= 512,
+        idx.ndim == 1,
+        idx.dtype == .uint32,
+        idx.size == activated.dim(0),
+        // Frozen target contract: affine Q4 group-64, no bias, exact packed
+        // shapes. Never re-quantized, never re-represented.
+        down.inputDims == 704,
+        down.outputDims == 2816,
+        down.numExperts == 128,
+        down.groupSize == 64,
+        down.bits == 4,
+        down.mode == .affine,
+        down.bias == nil,
+        down.weight.shape == [128, 2816, 88],
+        down.scales.shape == [128, 2816, 11],
+        down.weight.dtype == .uint32,
+        down.scales.dtype == .bfloat16
+    else { return nil }
+    guard let downBiases = down.biases,
+        downBiases.shape == [128, 2816, 11],
+        downBiases.dtype == .bfloat16,
+        route.expertOffsets.shape == [129],
+        route.tileOffsets.shape == [129],
+        route.expertOffsets.dtype == .uint32,
+        route.tileOffsets.dtype == .uint32
+    else { return nil }
+    CBv2EngageMark.once("prefill-nax-down")
+    let rows = activated.dim(0)
+    let groups = (rows + 7) / 8 + 128 - 1
+    return switchNaxDownPrefillKernel(
+        [
+            activated, down.weight, down.scales, downBiases,
+            route.expertOffsets, route.tileOffsets,
+        ],
+        grid: (groups * 64, 1, 1),
+        threadGroup: (64, 1, 1),
+        outputShapes: [[rows, 1, 2816]],
+        outputDTypes: [.bfloat16]
+    )[0]
+}
+
 // MARK: - SwitchGLU
 
 /// Semantic profile required by the exact Gemma direct-reduction experiment.
@@ -2185,10 +2341,10 @@ public class SwitchGLU: Module {
             } else if let sortedPlane {
                 // PRENORM-GATHER: the producer writes the sorted plane from
                 // the inverse order; `x` is only read if it declines.
-                // FLASH-MOE-PREFILL also needs the scan's expert/tile prefixes.
-                // Reuse that result rather than sorting once for the public
-                // route tuple and again for the fused kernel.
-                if switchFlashMoEPrefillEnabled,
+                // FLASH-MOE-PREFILL and NAX-DOWN-PREFILL also need the scan's
+                // expert/tile prefixes. Reuse that result rather than sorting
+                // once for the public route tuple and again for the fused kernel.
+                if switchFlashMoEPrefillEnabled || switchNaxDownPrefillEnabled,
                     let route = routeCountingSortPrefill(
                         indices.flattened(), m: indices.dim(-1), numExperts: numExperts)
                 {
@@ -2355,6 +2511,15 @@ public class SwitchGLU: Module {
                 let activated = xGateUp.flattened()[..<(xGateUp.size / 2)]
                     .reshaped(x.dim(0), 1, hiddenDims)
                 CBv2EngageMark.once("prefill-gateup-gelu-epilogue")
+                // NAX-DOWN-PREFILL: the sorted prefill plane's down
+                // projection only. Declines for decode, verification, and
+                // any off-contract geometry, leaving the incumbent below.
+                if let naxDown = switchNaxDownPrefill(
+                    activated: activated, idx: idx, route: flashRouteMetadata,
+                    down: downProj as? QuantizedSwitchLinear)
+                {
+                    return (naxDown, inverseOrder, true)
+                }
                 let downLhs: MLXArray? =
                     (idx.ndim == 1 && idx.size == 64) ? switchDownIdentity64 : nil
                 x = downProj(
@@ -2379,6 +2544,15 @@ public class SwitchGLU: Module {
             activated = activation(xGate) * xUp
         }
 
+        // NAX-DOWN-PREFILL: the sorted prefill plane's down projection only.
+        // Declines (nil) for decode, verification, and any off-contract
+        // geometry, preserving the established output graph.
+        if let naxDown = switchNaxDownPrefill(
+            activated: activated, idx: idx, route: flashRouteMetadata,
+            down: downProj as? QuantizedSwitchLinear)
+        {
+            return (naxDown, inverseOrder, true)
+        }
         // DOWN-LHS-IDENTITY: at the sorted [64] geometry the down projection
         // gathers activation row `assignment` for assignment `assignment`;
         // hand it that identity table instead of leaving `lhsIndices` nil,
