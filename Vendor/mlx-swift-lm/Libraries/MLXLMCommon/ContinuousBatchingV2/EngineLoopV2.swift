@@ -1635,9 +1635,14 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
         // Legacy rebuild (also the flag-OFF path, verbatim).
         let rowStates = ids.map { kvStates[$0]! }  // presence pre-checked
+        // Batch record fetch (one call site instead of N subscripts; same
+        // live references — see `records(for:)`).
+        let batchRecords = scheduler.records(for: ids)
         var params: [CBv2SamplingParams] = []
         params.reserveCapacity(ids.count)
-        for id in ids { params.append(scheduler.record(for: id)!.request.sampling) }
+        for maybeRec in batchRecords {
+            params.append(maybeRec!.request.sampling)  // presence pre-checked
+        }
         if chainTripleCacheEnabled {
             chainedTripleMemo = CBv2ChainedTripleMemo(
                 ids: ids, rowStates: rowStates, params: params,
@@ -2170,9 +2175,14 @@ public final class EngineLoopV2: @unchecked Sendable {
         }
 
         var finalizedPlainWork = false
+        // Batch record fetch (one call site instead of N subscripts; same
+        // live references in `sampledRows` order — see `records(for:)`).
+        // Interleaved loop-body mutations (`recordSampled`, `finishRequest`)
+        // are per-id, so upfront fetch is equivalent under every interleaving.
+        let stepRecords = scheduler.records(for: step.sampledRows)
         for (i, id) in step.sampledRows.enumerated() {
             if step.discard.contains(id) { continue }
-            guard let rec = scheduler.record(for: id) else { continue }
+            guard let rec = stepRecords[i] else { continue }
             finalizedPlainWork = true
             let token = Int(host[i])
             scheduler.recordSampled(id: id, token: token)
