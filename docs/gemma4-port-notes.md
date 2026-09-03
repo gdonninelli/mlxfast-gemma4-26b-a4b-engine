@@ -1870,3 +1870,72 @@ pre-existing warnings in untouched files). `swift test
 flag combinations (OFF/OFF, MoE-only, chain-only, both ON). No
 `./benchmark.sh --local-iterate` run per plan (directional local
 benchmarking deferred to the ranked box).
+
+## 11. Default-ON flip + driver host trim (A) + single-scan dedup (B)
+
+Same branch (`fused-moe-prefill-v2`). The ranked runner sets no
+environment, so default-OFF optimizations never fire on the box. This
+change flips every landed host optimization to default-ON (kill switches
+only) and adds the next two scan items. Still no kernel, Metal,
+quantization, or numerical change anywhere.
+
+### 11.1 Default-ON audit (all intended optimizations armed when unset)
+
+| Flag | Unset default | Kill (legacy) | Site |
+|---|---|---|---|
+| `DARKBLOOM_GEMMA4_MOE_DESC_HOIST` (§10.1) | ON (was OFF) | `0`/`false`/`no`/`off` | `SwitchLayers.swift` |
+| `MLXFAST_CHAIN_TRIPLE_CACHE` (§10.2) | ON (was OFF) | `0`/`false`/`no`/`off` | `EngineLoopV2.swift` |
+| `MLXFAST_PUBLISH_GAUGES_EVERY_N` (§11.2) | 4 (throttle ON) | `0`/`1`/`false`/`no`/`off` = every step | `EngineLoopV2.swift` |
+| `MLXFAST_LEASE_SCAN_IDLE_SKIP` (§11.3) | ON | `0`/`false`/`no`/`off` = always scan | `EngineLoopV2.swift` |
+| `MLXFAST_USAGE_SNAPSHOT_BATCH` (§11.4) | ON | `0`/`false`/`no`/`off` = per-row locks | `EngineLoopV2.swift` |
+| Single-scan dedup (§11.5) | always on (ungated pure dedup) | n/a (debug `assert` guards the invariant) | `EngineLoopV2.swift`, `LogitsPipelineV2.swift` |
+
+### 11.2 Gauge-publish throttle
+
+`EngineLoopV2.publishGaugesThrottled()` replaces the direct call at the
+two steady per-step sites only (chained launch, general launch).
+`MLXFAST_PUBLISH_GAUGES_EVERY_N` defaults to 4, clamps to 1...64.
+Drain/enqueue/idle/empty-plan/donation sites still call
+`publishGauges()` directly, so heartbeats never go stale across control
+transitions. Admission/capacity use the backend atomic reserve + requeue
+path, never these gauges, so ≤64-step staleness is telemetry-only.
+
+### 11.3 Lease-scan idle skip
+
+`MLXFAST_LEASE_SCAN_IDLE_SKIP` (default ON) skips `processLeaseExpiry`
+when `leasesByID` is empty — exactly equivalent when it fires (every
+optional chain inside yields nil; nothing can expire). Non-empty tables
+always scan; the steady-state per-row `expiredCause` scan is retained.
+Covers idle/edge steps only, by construction.
+
+### 11.4 Usage-snapshot batching
+
+`MLXFAST_USAGE_SNAPSHOT_BATCH` (default ON) collects a step's
+`CBv2Usage` snapshots in `refreshProgressLeases` and publishes them via
+the new `setUsageSnapshots` under ONE `stateLock` hold instead of one
+lock per row (8/step at B=8). Same values, same keys; the watchdog
+observes an atomic per-step update rather than an incremental one, which
+is equivalent for wedge terminals. The per-row `stream(for:)` lookups
+were deliberately NOT batched: `streams` is cross-thread state and 7
+saved uncontended locks are not worth the race analysis.
+
+### 11.5 Single greedy/order-only scan
+
+`launchChainedDecode` ran the same 6-field allSatisfy twice on the
+fallthrough (`admitsFusedGreedy`, then `orderOnly` inside
+`withOrderOnly`). It now evaluates `CBv2OrderOnlyLogits.orderOnly`
+once into `greedyOrderOnly`, reuses it for the fused-head gate and for
+the new `withPrecomputedOrderOnly` scope. Ungated: sharing one
+evaluation of character-identical predicates cannot change dispatch. A
+debug-only `assert` (stripped in release, active in `swift test`) checks
+the sampler-side predicate still agrees, so a future divergence fails in
+CI instead of silently changing dispatch. `executeMixed` keeps its
+single `withOrderOnly` (no double scan there; untouched).
+
+### 11.6 Verification
+
+Release build clean (no new warnings in touched files). Contract suite
+583/22 green twice: default environment (everything ON) and fully
+kill-switched (`..._HOIST=0 ..._CACHE=0 ..._EVERY_N=1 ..._SKIP=0
+..._BATCH=0`, i.e. the legacy paths). No local benchmark run and no
+cool-gate wait per plan.

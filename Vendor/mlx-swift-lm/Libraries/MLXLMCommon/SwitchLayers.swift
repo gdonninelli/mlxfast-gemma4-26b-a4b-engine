@@ -527,16 +527,17 @@ private let expertPrefixBoundsEnabled: Bool = {
 /// Host-side decode-path micro-cache for the MoE routing plane. When enabled
 /// (`DARKBLOOM_GEMMA4_MOE_DESC_HOIST=1`), per-`SwitchGLU` module-geometry
 /// eligibility is evaluated once per module instead of on every layer-round
-/// (30x per decode token at B=8). Unset or `0`/`false`/`no`/`off` restores
-/// the legacy inline comparisons exactly. Dynamic per-call tensor checks
-/// (ndim/shape/dtype/size) always still run; only the immutable
-/// module-geometry half is cached, and `SwitchGLU` is shared with other
-/// architectures, so the cache is per-instance (`lazy var`), never
-/// file-global. No graph, numeric, or kernel change.
+/// (30x per decode token at B=8). ON by default: unset or any value other
+/// than `0`/`false`/`no`/`off` enables the cached-eligibility path, and only
+/// those explicit kill values restore the legacy inline comparisons.
+/// Dynamic per-call tensor checks (ndim/shape/dtype/size) always still run;
+/// only the immutable module-geometry half is cached, and `SwitchGLU` is
+/// shared with other architectures, so the cache is per-instance
+/// (`lazy var`), never file-global. No graph, numeric, or kernel change.
 private let moeDescHoistEnabled: Bool = {
     guard let raw = ProcessInfo.processInfo.environment[
         "DARKBLOOM_GEMMA4_MOE_DESC_HOIST"]
-    else { return false }
+    else { return true }
     return !["0", "false", "no", "off"].contains(raw.lowercased())
 }()
 
