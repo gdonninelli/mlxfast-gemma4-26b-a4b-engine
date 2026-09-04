@@ -4,7 +4,7 @@
 
 * upstream commit: `75802e97` (Validate submission `7e3fa0f9-9508-49c8-a0a9-ad2507052a96`, Crown, score **2.45171452665331**, 2026-09-04 06:56 UTC, solver DrCleverHans / Gemini 3.8 Flash / Antigravity)
 * local `main`: STALE at `4eb8e5ee` (behind upstream/main by ~15+ promoted submissions; do not use as base for new work until synced)
-* current branch: `fused-moe-prefill-v4` @ `1f4e7282` = Crown `75802e97` + IDEA-001 (at1 params reuse, +14/-1, 1 file). Submitted as `69cdbcc8-7027-4fa5-9590-80d06e3c654b` (status `validating` at submit time); official result pending.
+* current branch: `fused-moe-prefill-v4` @ `d8329cf9` = Crown `75802e97` + IDEA-001 (at1 params reuse, +14/-1, 1 file). Submitted as `69cdbcc8-7027-4fa5-9590-80d06e3c654b`: REJECTED, score 2.43854809527752, diff -0.013166 (-1.39%), 2026-09-04. Scored code delta vs Crown is exactly the 15-line change (notebook file is not an editable path and never enters the archive).
 * last submitted candidates (all on v3 lineage, all REJECTED):
   * `e3f1297` (commit `0dc7bd5`) score 2.40559768788294, diff -0.015683 (-1.65%)
   * `0485d6c` (commit `7011062`) score 2.41394789482433, diff -0.009762 (-1.03%)
@@ -42,9 +42,10 @@ Expected benefit: tiny (prefill exponent 0.25; single alloc/call over ~232 calls
 Affected hot path: prefill composed SDPA via at1 (`scores→stats→addMM`).
 Evidence: adjacent `CBv2PrefillSoftmaxVecV1.apply` already does this and Crown credits it with record prefill; line 911 is the only remaining fresh `MLXArray([UInt32...])` in the file; decode twin already caches.
 Implementation difficulty: low. Risk: low (read-only constant input tensor, same values; fallback to fresh alloc on miss).
-Status: implementing (v4).
+Status: REJECTED 2026-09-04 (submission `69cdbcc8`, 2.43854809527752, -1.39% vs Crown).
 Relevant files: `Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/ComposedPrefillSDPAV1.swift`
-Result: implemented 2026-09-04 on branch `fused-moe-prefill-v4` from Crown `75802e97`; diff +14/-1 in 1 file (new `paramsForTraffic` wrapper reusing `getParams` table; at1 call site). `swift build -c release --force-resolved-versions` clean (72s, only pre-existing Crown warnings); `swift test --force-resolved-versions` 583/583 pass. Submitted (see below); official result pending.
+Result: implemented 2026-09-04 on branch `fused-moe-prefill-v4` from Crown `75802e97`; diff +14/-1 in 1 file (new `paramsForTraffic` wrapper reusing `getParams` table; at1 call site). `swift build -c release --force-resolved-versions` clean (72s, only pre-existing Crown warnings); `swift test --force-resolved-versions` 583/583 pass. Remote: REJECTED at -1.39%.
+Suspected explanation: a removed 2-element host alloc cannot plausibly cost 1.4% of composite on its own. Candidates: (1) sharing one `eval`'d device-resident tensor across many graphs where fresh host-constructed tensors were graph-local changes MLX graph/lifetime behavior (extra dependency edges or lost constant-folding); the fresh `MLXArray([UInt32 x2])` may be cheap/host-side while the shared table forces a device read per launch. (2) Run variance / cold-runner anomaly (Crown's own note documents ~0.5% session swings; -1.39% is larger but a single sample). (3) 5/5 of our submissions now sit below Crown (v3: -1.03% to -5.73%, v4: -1.39%), including one that is Crown+15 lines — a systematic offset (packaging, branch construction, or persistent cold-side session bias) cannot be ruled out. Do NOT retry this shape without evidence distinguishing (1) from (2)/(3). The discriminating experiment is a control submission of byte-identical Crown (see Next experiments).
 
 ### IDEA-002 — Half-domain dequant for generic quantized.cpp MMA8 twin
 Hypothesis: same `0x6400` transform on the cold `MMA8_STEP` twin helps any shape falling through to MLX dispatch instead of Swift override.
@@ -76,7 +77,7 @@ Relevant files: `.../ContinuousBatchingV2/EngineLoopV2.swift`, `SchedulerV2.swif
 ## Next experiments
 
 Ordered by expected value × confidence ÷ cost:
-1. IDEA-001 (this iteration): at1 params reuse. Cost ~15 lines. Confidence medium (proven pattern, missed site). Benefit tiny but positive expected.
+1. CONTROL (proposed, needs user go-ahead): submit byte-identical Crown (`upstream/main` `75802e97`, zero code delta) as a calibration sample. Cost: one submission, ~15 min wall. Value: decisive — if the control also lands ~1-1.5% below Crown, our pipeline/session has a systematic offset and further code hypotheses are uninterpretable until it is understood; if the control lands at/above Crown, the -1.39% belongs to IDEA-001's 15 lines (graph-sharing cost hypothesis) and the offset theory dies. No code, no build risk.
 2. Census before any MoE fusion: measure which decode projection (gate/up/down, qkv/o, head) dominates DRAM at batch-8 on ranked geometry; only then propose fusion. (No local thermal benchmarks per policy — use static traffic arithmetic + remote submissions as the experiment.)
 3. IDEA-002 only if evidence shows fallback-twin traffic (e.g., MTP verify widths hitting generic MMA8). Currently no such evidence — do not do blindly.
 4. Never retry IDEA-004 family without new profiler-grade evidence.
