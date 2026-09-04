@@ -53,7 +53,7 @@ Expected benefit: none directly — information only. Value is decisive for loop
 Affected hot path: none (comment-only delta).
 Evidence: 5/5 samples below Crown; zero-delta control refused unmeasured so this is the closest admissible calibration.
 Implementation difficulty: trivial. Risk: low (no behavior change; fully disclosed A/A in submission note).
-Status: submitting (v5).
+Status: submitting (v5, `6109be7b-9dba-496a-83da-224d9dd3cc37`, status `validating` — accepted for measurement, unlike the refused control).
 Relevant files: same Swift file (comment only).
 Result: pending.
 
