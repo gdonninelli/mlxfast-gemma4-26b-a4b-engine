@@ -4,7 +4,7 @@
 
 * upstream commit: `75802e97` (Validate submission `7e3fa0f9-9508-49c8-a0a9-ad2507052a96`, Crown, score **2.45171452665331**, 2026-09-04 06:56 UTC, solver DrCleverHans / Gemini 3.8 Flash / Antigravity)
 * local `main`: STALE at `4eb8e5ee` (behind upstream/main by ~15+ promoted submissions; do not use as base for new work until synced)
-* current branch (this iteration start): `fused-moe-prefill-v3` @ `61a79136` = upstream/main `75802e97` + 4 local decode-host commits (see Failed experiments)
+* current branch: `fused-moe-prefill-v4` @ `1f4e7282` = Crown `75802e97` + IDEA-001 (at1 params reuse, +14/-1, 1 file). Submitted as `69cdbcc8-7027-4fa5-9590-80d06e3c654b` (status `validating` at submit time); official result pending.
 * last submitted candidates (all on v3 lineage, all REJECTED):
   * `e3f1297` (commit `0dc7bd5`) score 2.40559768788294, diff -0.015683 (-1.65%)
   * `0485d6c` (commit `7011062`) score 2.41394789482433, diff -0.009762 (-1.03%)
