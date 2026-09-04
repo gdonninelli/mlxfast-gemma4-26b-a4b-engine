@@ -708,6 +708,12 @@ enum CBv2PrefillSoftmaxVecV1 {
     /// table removes one host allocation + H2D per attention call on the at1
     /// path; a non-standard axis still builds a fresh tensor, exactly as
     /// today. Read-only constant input, never a mutated output.
+    ///
+    /// A/A CALIBRATION (v5): this wrapper and its call site are
+    /// behavior-identical to v4 on every geometry — same table, same
+    /// fallback, same values. This submission re-measures the identical
+    /// behavior to estimate session variance before any new code hypothesis
+    /// is tested. See AUTORESEARCH_MLXFAST.md.
     @inline(__always)
     static func paramsForTraffic(axisSize: Int, numSimdgroups: Int) -> MLXArray {
         getParams(axisSize: axisSize, numSimdgroups: numSimdgroups)

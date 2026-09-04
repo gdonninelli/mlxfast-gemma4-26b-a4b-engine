@@ -4,7 +4,7 @@
 
 * upstream commit: `75802e97` (Validate submission `7e3fa0f9-9508-49c8-a0a9-ad2507052a96`, Crown, score **2.45171452665331**, 2026-09-04 06:56 UTC, solver DrCleverHans / Gemini 3.8 Flash / Antigravity)
 * local `main`: STALE at `4eb8e5ee` (behind upstream/main by ~15+ promoted submissions; do not use as base for new work until synced)
-* current branch: `fused-moe-prefill-v4` @ `d8329cf9` = Crown `75802e97` + IDEA-001 (at1 params reuse, +14/-1, 1 file). Submitted as `69cdbcc8-7027-4fa5-9590-80d06e3c654b`: REJECTED, score 2.43854809527752, diff -0.013166 (-1.39%), 2026-09-04. Scored code delta vs Crown is exactly the 15-line change (notebook file is not an editable path and never enters the archive).
+* current branch: `fused-moe-prefill-v5` = v4 behavior + comment-only A/A marker (zero behavior delta by construction: comments do not reach compiled code or Metal sources). Purpose: re-measure identical behavior to estimate session variance after the zero-delta control was refused unmeasured. Submission ID pending.
 * last submitted candidates (all on v3 lineage, all REJECTED):
   * `e3f1297` (commit `0dc7bd5`) score 2.40559768788294, diff -0.015683 (-1.65%)
   * `0485d6c` (commit `7011062`) score 2.41394789482433, diff -0.009762 (-1.03%)
@@ -47,6 +47,16 @@ Relevant files: `Vendor/mlx-swift-lm/Libraries/MLXLMCommon/ContinuousBatchingV2/
 Result: implemented 2026-09-04 on branch `fused-moe-prefill-v4` from Crown `75802e97`; diff +14/-1 in 1 file (new `paramsForTraffic` wrapper reusing `getParams` table; at1 call site). `swift build -c release --force-resolved-versions` clean (72s, only pre-existing Crown warnings); `swift test --force-resolved-versions` 583/583 pass. Remote: REJECTED at -1.39%.
 Suspected explanation: a removed 2-element host alloc cannot plausibly cost 1.4% of composite on its own. Candidates: (1) sharing one `eval`'d device-resident tensor across many graphs where fresh host-constructed tensors were graph-local changes MLX graph/lifetime behavior (extra dependency edges or lost constant-folding); the fresh `MLXArray([UInt32 x2])` may be cheap/host-side while the shared table forces a device read per launch. (2) Run variance / cold-runner anomaly (Crown's own note documents ~0.5% session swings; -1.39% is larger but a single sample). (3) 5/5 of our submissions now sit below Crown (v3: -1.03% to -5.73%, v4: -1.39%), including one that is Crown+15 lines — a systematic offset (packaging, branch construction, or persistent cold-side session bias) cannot be ruled out. Do NOT retry this shape without evidence distinguishing (1) from (2)/(3). The discriminating experiment is a control submission of byte-identical Crown (see Next experiments).
 
+### IDEA-005 — A/A replicate of v4 behavior (variance probe)
+Hypothesis: v4's -1.39% is session noise, not code effect; an identical-behavior resubmission should scatter, plausibly back to Crown.
+Expected benefit: none directly — information only. Value is decisive for loop discipline: replicate at Crown → v4 unresolved, single samples noisy ±1%, require replication/effect sizes going forward; replicate ~-1.4% again → the 15 lines (or my pipeline) really cost, escalate to pristine-clone packaging test.
+Affected hot path: none (comment-only delta).
+Evidence: 5/5 samples below Crown; zero-delta control refused unmeasured so this is the closest admissible calibration.
+Implementation difficulty: trivial. Risk: low (no behavior change; fully disclosed A/A in submission note).
+Status: submitting (v5).
+Relevant files: same Swift file (comment only).
+Result: pending.
+
 ### IDEA-002 — Half-domain dequant for generic quantized.cpp MMA8 twin
 Hypothesis: same `0x6400` transform on the cold `MMA8_STEP` twin helps any shape falling through to MLX dispatch instead of Swift override.
 Expected benefit: ~0 (Swift hot planes already override). Evidence: twin text at quantized.cpp:2343 still integer. Difficulty: low-medium (must keep `.metal`/`.h`/cpp triplets in step + `_nax` twin + rebuild metallib for AoT kernels — MMA8 twin is JIT via mlx-generated, so metallib rebuild not needed, but verify). Risk: low (bitwise-identical math). Status: unexplored (deferred — no evidence twin is hot).
@@ -76,7 +86,7 @@ Relevant files: `.../ContinuousBatchingV2/EngineLoopV2.swift`, `SchedulerV2.swif
 
 ## Next experiments
 
-CONTROL (in flight): branch `control-crown-75802e97` = byte-identical `upstream/main` `75802e97`, zero code delta, submitted as `9641b3cb-6ea6-4c86-a4bf-fdd0bd5ea12e` (status `validating` at submit time) with a full-disclosure calibration note. Decision tree: reads ~1%+ low → systematic offset confirmed, suspend code work, diagnose pipeline (archive diff, pristine-clone resubmission); reads at Crown → single samples are noisy ±1%, reclassify v4 as unresolved-needs-replicate; reads mid-way → replicate once more before any code verdicts.
+CONTROL (blocked): branch `control-crown-75802e97` = byte-identical `upstream/main` `75802e97`, submitted as `9641b3cb-6ea6-4c86-a4bf-fdd0bd5ea12e` 2026-09-04 14:12 UTC → auto-REJECTED with n/a score, n/a metrics, no snapshot commit. Never measured. Best explanation: pre-validation exact-duplicate gate (archive hash matches Crown `7e3fa0f`'s own payload), not a performance verdict. Lesson: the platform will not measure identical code; calibration must differ at least nominally in bytes while identical in behavior. Fallback: v5 A/A replicate (below).
 Ordered by expected value × confidence ÷ cost after the control resolves:
 2. Census before any MoE fusion: measure which decode projection (gate/up/down, qkv/o, head) dominates DRAM at batch-8 on ranked geometry; only then propose fusion. (No local thermal benchmarks per policy — use static traffic arithmetic + remote submissions as the experiment.)
 3. IDEA-002 only if evidence shows fallback-twin traffic (e.g., MTP verify widths hitting generic MMA8). Currently no such evidence — do not do blindly.
