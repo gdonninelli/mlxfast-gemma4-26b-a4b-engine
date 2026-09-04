@@ -76,8 +76,8 @@ Relevant files: `.../ContinuousBatchingV2/EngineLoopV2.swift`, `SchedulerV2.swif
 
 ## Next experiments
 
-Ordered by expected value × confidence ÷ cost:
-1. CONTROL (proposed, needs user go-ahead): submit byte-identical Crown (`upstream/main` `75802e97`, zero code delta) as a calibration sample. Cost: one submission, ~15 min wall. Value: decisive — if the control also lands ~1-1.5% below Crown, our pipeline/session has a systematic offset and further code hypotheses are uninterpretable until it is understood; if the control lands at/above Crown, the -1.39% belongs to IDEA-001's 15 lines (graph-sharing cost hypothesis) and the offset theory dies. No code, no build risk.
+CONTROL (in flight): branch `control-crown-75802e97` = byte-identical `upstream/main` `75802e97`, zero code delta, submitted as `9641b3cb-6ea6-4c86-a4bf-fdd0bd5ea12e` (status `validating` at submit time) with a full-disclosure calibration note. Decision tree: reads ~1%+ low → systematic offset confirmed, suspend code work, diagnose pipeline (archive diff, pristine-clone resubmission); reads at Crown → single samples are noisy ±1%, reclassify v4 as unresolved-needs-replicate; reads mid-way → replicate once more before any code verdicts.
+Ordered by expected value × confidence ÷ cost after the control resolves:
 2. Census before any MoE fusion: measure which decode projection (gate/up/down, qkv/o, head) dominates DRAM at batch-8 on ranked geometry; only then propose fusion. (No local thermal benchmarks per policy — use static traffic arithmetic + remote submissions as the experiment.)
 3. IDEA-002 only if evidence shows fallback-twin traffic (e.g., MTP verify widths hitting generic MMA8). Currently no such evidence — do not do blindly.
 4. Never retry IDEA-004 family without new profiler-grade evidence.
